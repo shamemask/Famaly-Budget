@@ -1,0 +1,342 @@
+version: '3'
+
+vars:
+  PYTHON_VERSION: 3.11.0
+  PYENV_NAME: prompt-engineer
+
+tasks:
+  ##################
+  # ### Common ### #
+  ##################
+
+  # Команды из категории common вызываются внутри контейнера или на локальной машине.
+  # Их назначение — унифицировать интерфейс взаимодействия с системой и навести DRY.
+  # Они встраиваются в остальные категории (development, testing, deployment).
+  # Они исходят из того, что для них уже подняты все сторонние сервисы типа Postgres и Redis.
+
+  run:django:
+    cmds:
+      - python3 manage.py runserver 127.0.0.1:8000
+    dir: ./src
+
+  run:celery-worker:
+    cmds:
+      - watchmedo auto-restart --directory=src/ --pattern=*.py --recursive -- celery -A prompt_engineer worker -l DEBUG --pool solo
+
+  run:celery-beat:
+    cmds:
+      - watchmedo auto-restart --directory=src/ --pattern=*.py --recursive -- celery -A prompt_engineer beat -l DEBUG
+
+  migrate:
+    cmds:
+      - python3 manage.py migrate {{ .CLI_ARGS }}
+    dir: ./src
+
+  makemigrations:
+    cmds:
+      - python3 manage.py makemigrations {{ .CLI_ARGS }}
+    dir: ./src
+
+  collectstatic:
+    cmds:
+      - python3 manage.py collectstatic {{ .CLI_ARGS }}
+    dir: ./src
+
+  test:
+    cmds:
+      - pytest -svv {{ .CLI_ARGS }} src/
+    env:
+        BACKEND_IS_CACHE_ENABLED: 'true'
+
+
+  format:isort:
+    cmds:
+      - echo "Isort temporarily disabled"
+      # - isort --profile black .
+    dir: ./src
+
+  format:ruff:
+    cmds:
+      - ruff check --fix-only --ignore COM819 src/
+      - ruff format src/
+
+  format:
+    cmds:
+      - task: format:isort
+      - task: format:ruff
+
+  lint:ruff:
+    cmds:
+      - ruff check .
+    dir: ./src
+
+  lint:mypy:
+    cmds:
+      - echo "Type checking temporarily disabled"
+      # - mypy --pretty --show-error-context --show-error-code-links src {{ .LINT_MYPY_KWARGS }}
+    vars:
+      LINT_MYPY_KWARGS: '{{ default "" .LINT_MYPY_KWARGS }}'
+
+  lint:
+    cmds:
+      - task: lint:ruff
+      - task: lint:mypy
+        vars:
+          LINT_MYPY_KWARGS: '{{ default "" .LINT_MYPY_KWARGS }}'
+
+  install:taskfile:
+    cmds:
+      - sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d
+
+  install:pyenv:
+    cmds:
+      - bash -c "[[ -v PYENV_ROOT ]] && echo 'Skipping installation…' || curl https://pyenv.run | bash"
+      - pyenv install --skip-existing {{ .PYTHON_VERSION }}
+      - pyenv virtualenv {{ .PYTHON_VERSION }} {{ .PYENV_NAME }} || true
+
+  install:poetry:
+    cmds:
+      - curl -sSL https://install.python-poetry.org | python3 -
+
+  sleep:
+    cmds:
+      - sleep 1d
+
+
+  #######################
+  # ### DEVELOPMENT ### #
+  #######################
+
+  # Команды из категории development вызываются на локальной машине.
+  # Их назначение — поднять окружение (Postgres и Redis) для разраба.
+  # Celery и Django запускать командами run:celery-worker, run:celery-beat и run:django.
+  # В этой категории ожидается наличие локального .env-файла.
+
+  development:start:
+    cmds:
+      - docker compose up postgres redis -d
+    env:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USERNAME: postgres
+      POSTGRES_PASSWORD: password1234
+      POSTGRES_DATABASE_BACKEND: prompt-engineer
+      BACKEND_IS_LOCALHOST_TRUSTED: true
+
+  development:stop:
+    cmds:
+      - docker compose stop postgres redis
+
+
+  ###################
+  # ### TESTING ### #
+  ###################
+
+  # Команды из категории testing вызываются во время CI.
+  # Их назначение — сбилдить имедж и протестить его код.
+  # Для тестов поднимается Postgres, а вот Redis и Celery не поднимаются.
+
+  # testing:image:* выполняются в Dockerfile
+  # testing:compose:* выполняются в Github Actions
+
+  testing:image:install:
+    cmds:
+      - poetry install --no-root --no-interaction --no-ansi
+
+  testing:image:start:
+    cmds:
+#      - task: lint
+#        vars:
+#          LINT_MYPY_KWARGS: --cache-dir /tmp
+      - task: test
+
+  testing:compose:build-backend:
+    cmds:
+      - docker compose build backend
+    env:
+      TARGET: testing
+
+  testing:compose:start:
+    cmds:
+      - docker compose up postgres -d
+      - docker compose run --rm backend testing:image:start
+    env:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USERNAME: postgres
+      POSTGRES_PASSWORD: password1234
+      POSTGRES_DATABASE_BACKEND: prompt-engineer
+      BACKEND_IS_LOCALHOST_TRUSTED: true
+
+  # Эти шаги выполняются в CI на стороне GitHub Actions
+  testing:start:
+    cmds:
+      - task: testing:compose:build-backend
+      - task: testing:compose:start
+
+
+  ######################
+  # ### DEPLOYMENT ### #
+  ######################
+
+  # Команды из категории deployment вызываются частично во время CI и частично на проде.
+  # В CI они исходят из того, что docker login уже был выполнен.
+
+  # deployment:image:* выполняются в Dockerfile
+  # deployment:compose:* выполняются в Github Actions
+
+  deployment:image:install:
+    cmds:
+      - poetry install --only=main --no-root --no-interaction --no-ansi
+
+  deployment:image:start:
+    cmds:
+      - task: migrate
+      - gunicorn --bind 0.0.0.0:8000 prompt_engineer.wsgi
+    dir: ./src
+
+  deployment:image:start-celery-worker:
+    cmds:
+      - celery -A prompt_engineer worker -l INFO --pool solo
+    dir: ./src
+
+  deployment:image:start-celery-beat:
+    cmds:
+      - celery -A prompt_engineer beat -l INFO --schedule /tmp/celerybeat-schedule.db
+    dir: ./src
+
+  deployment:compose:build:
+    cmds:
+      - docker compose build backend admin
+    env:
+      TARGET: deployment
+
+  deployment:compose:push:
+    cmds:
+      - docker compose push backend admin
+
+  deployment:compose:pull-backend:
+    cmds:
+      - docker compose pull admin backend
+    dotenv:
+      - deployment.env
+
+  deployment:compose:pull-frontend:
+    cmds:
+      - docker compose pull frontend
+    dotenv:
+      - deployment.env
+
+  deployment:compose:stop:
+    cmds:
+      - docker compose stop
+
+  deployment:compose:start:
+    cmds:
+      - docker compose up -d
+    dotenv:
+      - deployment.env
+    env:
+      TARGET: deployment
+
+  # Этот шаг выполняется в CI на стороне GitHub Actions.
+  # После него артефакты выгружаются на виртуальный сервер продакшена через SCP
+  deployment:prepare:
+    cmds:
+      - task: deployment:compose:build
+      - task: deployment:compose:push
+
+  # Нижеследующие шаги выполняются в CI на виртуальном сервере продакшена
+
+  deployment:update-backend:
+    cmds:
+      - task: deployment:dump-postgres
+      - task: deployment:compose:pull-backend
+      - task: deployment:compose:stop
+      - task: deployment:compose:start
+      - task: deployment:copy-static
+    vars:
+      SERVICE_NAMES: backend
+
+  deployment:update-frontend:
+    cmds:
+      - task: deployment:compose:pull-frontend
+      - task: deployment:compose:stop
+      - task: deployment:compose:start
+    vars:
+      SERVICE_NAMES: frontend
+
+  # Done before each deploy and with crontab 0 0 * * * bash -c "cd /root/prompt_engineer && task deployment:dump-postgres"
+  deployment:dump-postgres:
+    dotenv: 
+      - deployment.env
+    cmds:
+      - |
+        # Encryption settings
+        SQL_FILE="/root/prompt_engineer/backups/backup-latest.sql"
+        ARCHIVE_NAME="/root/prompt_engineer/backups/backup-latest.tar.gz"
+        ENCRYPTED_FILE="/root/prompt_engineer/backups/backup-latest.tar.gz.enc"
+        PASSWORD="yIMnfj8c7FxwfC4oOPsAQpcdaYiQTYbEzK"
+        TIMESTAMP=$(date +"%Y.%m.%d-%H:%M:%S")
+        # Uploading settings
+        SPACE_NAME="f4e2cc6123904c86b048880b9b684d04"
+        SPACE_REGION="ams3"
+        DESTINATION_FOLDER=${BACKEND_HOST}
+        ACCESS_KEY="DO00AX6VL6ECTT9PMKEQ"
+        SECRET_KEY="YyIMnfj8c7FxwfC4oOPsAQpcdaYiQTYbEzK/PnaJITk"
+
+        # Prepare backup folder
+        mkdir -p /root/prompt_engineer/backups
+        # Create backup and pull it from Docker container
+        docker exec prompt_engineer-postgres-1 bash -c "pg_dump -U postgres prompt-engineer > /tmp/prompt_engineer_database.sql"
+        docker cp prompt_engineer-postgres-1:/tmp/prompt_engineer_database.sql /root/prompt_engineer/backups/backup-latest.sql
+        cp /root/prompt_engineer/backups/backup-latest.sql "/root/prompt_engineer/backups/backup-${TIMESTAMP}.sql"
+        # Encrypt and upload the backup
+
+        # Compress
+        tar -czvf $ARCHIVE_NAME $SQL_FILE
+        # Untar with: tar -xzvf $DECRYPTED_ARCHIVE
+
+        # Encrypt
+        openssl enc -aes-256-cbc -salt -in $ARCHIVE_NAME -out $ENCRYPTED_FILE -k $PASSWORD
+        # Decrypt with: openssl enc -d -aes-256-cbc -in $ENCRYPTED_FILE -out $DECRYPTED_ARCHIVE -k $PASSWORD
+
+        # Configure AWS CLI to use DigitalOcean Spaces
+        aws configure set aws_access_key_id $ACCESS_KEY
+        aws configure set aws_secret_access_key $SECRET_KEY
+        aws configure set default.region $SPACE_REGION
+        aws configure set default.output json
+
+        # Attempt to create the destination directory (this will succeed whether the directory exists or not)
+        echo "Ensuring directory exists..."
+        aws s3api put-object --bucket $SPACE_NAME --key $DESTINATION_FOLDER/ --endpoint-url=https://$SPACE_REGION.digitaloceanspaces.com > /dev/null 2>&1
+
+        # Upload the file to the specified folder
+        aws s3 cp $ENCRYPTED_FILE s3://$SPACE_NAME/$DESTINATION_FOLDER/backup-$TIMESTAMP.tar.gz.enc --endpoint-url=https://$SPACE_REGION.digitaloceanspaces.com
+        # Check if the upload was successful
+        if [ $? -eq 0 ]; then
+          echo "Backup uploaded successfully."
+        else
+          echo "Backup upload failed."
+          exit 1
+        fi
+
+        # Copy the file within the same DigitalOcean Space
+        aws s3 cp s3://$SPACE_NAME/$DESTINATION_FOLDER/backup-$TIMESTAMP.tar.gz.enc s3://$SPACE_NAME/$DESTINATION_FOLDER/backup-latest.tar.gz.enc --endpoint-url=https://$SPACE_REGION.digitaloceanspaces.com
+        # Check if the copy was successful
+        if [ $? -eq 0 ]; then
+          echo "Latest backup version set."
+        else
+          echo "Setting latest backup version failed."
+          exit 1
+        fi
+
+  deployment:copy-static:
+    cmds:
+      - rm -rf /tmp/djangostatic/
+      - docker cp prompt_engineer-backend-1:/app/static/ /tmp/djangostatic/
+      - docker cp /tmp/djangostatic/ prompt_engineer-admin-1:/usr/share/nginx/html/
+
+  deployment:prune:
+    cmds:
+      - docker system prune --force
