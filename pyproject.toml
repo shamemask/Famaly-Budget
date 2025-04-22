@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "famaly-budget"
+version = "0.1.0"
+description = ""
+authors = ["Daniil <77277774+shamemask@users.noreply.github.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+django = "^5.2"
+djangorestframework = "^3.16.0"
+python-decouple = "^3.8"
+pytest-django = "^4.11.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
