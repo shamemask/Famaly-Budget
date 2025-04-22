@@ -1,0 +1,12 @@
+{% extends "admin/change_list.html" %}
+{% block content %}
+    <div>
+        <h1>Загрузка файла транзакций</h1>
+        <form action="{% url 'admin:transactions-upload' %}" method="post" enctype="multipart/form-data">
+            {% csrf_token %}
+            {{ form.as_p }}
+            <button type="submit">Загрузить</button>
+        </form>
+    </div>
+    {{ block.super }}
+{% endblock %}
