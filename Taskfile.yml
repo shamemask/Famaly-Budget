@@ -5,6 +5,9 @@ vars:
   PYENV_NAME: family-budget
 
 tasks:
+  run:
+    cmds:
+      - task: run:django
 
   run:django:
     cmds:
